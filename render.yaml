@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: mafia-git-pages-server
+    runtime: node
+    branch: arena/49baeaa5-mafia-git-pages
+    plan: free
+    region: frankfurt
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_ENV
+        value: production
