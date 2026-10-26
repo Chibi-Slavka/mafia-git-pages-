@@ -1,19 +1,13 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import test from 'node:test';
-import WebSocket from 'ws';
+import { io as createSocket } from 'socket.io-client';
 import { assignRoles, createGameServer, PROTOCOL } from './index.js';
 
 function makeClient(socket, name) {
   const messages = [];
   const waiters = [];
-  socket.on('message', (raw) => {
-    let message;
-    try {
-      message = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+  socket.on('mafia:message', (message) => {
     const waiterIndex = waiters.findIndex((waiter) => waiter.predicate(message));
     if (waiterIndex >= 0) {
       const [waiter] = waiters.splice(waiterIndex, 1);
@@ -46,13 +40,13 @@ function makeClient(socket, name) {
     name,
     waitFor,
     send(message) {
-      socket.send(JSON.stringify(message));
+      socket.emit('mafia:message', message);
     },
     close() {
-      if (socket.readyState === WebSocket.CLOSED) return Promise.resolve();
+      if (!socket.connected) return Promise.resolve();
       return new Promise((resolve) => {
-        socket.once('close', resolve);
-        socket.close();
+        socket.once('disconnect', resolve);
+        socket.disconnect();
       });
     }
   };
@@ -66,7 +60,7 @@ async function startHarness(t) {
   app.httpServer.listen(0, '127.0.0.1');
   await once(app.httpServer, 'listening');
   const address = app.httpServer.address();
-  const url = `ws://127.0.0.1:${address.port}/ws`;
+  const url = `http://127.0.0.1:${address.port}`;
   const clients = [];
   t.after(async () => {
     await Promise.all(clients.map((client) => client.close().catch(() => {})));
@@ -74,10 +68,21 @@ async function startHarness(t) {
   });
 
   async function connect(name, clientId = `client-${Buffer.from(name).toString('hex')}`) {
-    const socket = new WebSocket(url, { origin: 'http://localhost:8000' });
-    await once(socket, 'open');
+    const socket = createSocket(url, {
+      path: '/socket.io',
+      extraHeaders: { origin: 'http://localhost:8000' },
+      reconnection: false,
+      timeout: 2500,
+      autoConnect: false
+    });
     const client = makeClient(socket, name);
     clients.push(client);
+    const connected = new Promise((resolve, reject) => {
+      socket.once('connect', resolve);
+      socket.once('connect_error', reject);
+    });
+    socket.connect();
+    await connected;
     client.send({
       type: 'hello',
       protocol: PROTOCOL,
@@ -113,7 +118,7 @@ test('HTTP health endpoint reports the protocol', async (t) => {
   assert.equal(body.protocol, PROTOCOL);
 });
 
-test('players can create and join a room, and role data stays private', async (t) => {
+test('Socket.IO clients can create/join a room, and role data stays private', async (t) => {
   const { connect } = await startHarness(t);
   const host = await connect('Хозяин');
   host.send({

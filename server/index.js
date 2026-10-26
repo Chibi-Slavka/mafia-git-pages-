@@ -1,10 +1,9 @@
 import { createServer } from 'node:http';
 import { randomInt } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { WebSocket, WebSocketServer } from 'ws';
+import { Server as SocketIOServer } from 'socket.io';
 
 export const PROTOCOL = 'Mafia-2026';
-const OPEN = WebSocket.OPEN;
 const WAITING = 'Ожидание игроков';
 const PLAYING = 'Игра началась';
 const FINISHED = 'Партия завершена';
@@ -114,7 +113,8 @@ export function createGameServer({ env = process.env, logger = console } = {}) {
       jsonResponse(response, 200, {
         name: 'MAFIA game server',
         protocol: PROTOCOL,
-        websocket: '/ws',
+        socketIoPath: '/socket.io',
+        socketIoEvent: 'mafia:message',
         health: '/health'
       });
       return;
@@ -122,15 +122,24 @@ export function createGameServer({ env = process.env, logger = console } = {}) {
     jsonResponse(response, 404, { error: 'Not found' });
   });
 
-  const webSocketServer = new WebSocketServer({
-    noServer: true,
-    maxPayload: 16 * 1024,
-    perMessageDeflate: false
+  const originAllowed = (origin) => isAllowedOrigin(origin, env);
+  const io = new SocketIOServer(httpServer, {
+    path: '/socket.io',
+    cors: {
+      origin(origin, callback) { callback(null, originAllowed(origin)); },
+      methods: ['GET', 'POST']
+    },
+    allowRequest(request, callback) {
+      callback(null, originAllowed(request.headers.origin));
+    },
+    maxHttpBufferSize: 16 * 1024,
+    pingInterval: 25_000,
+    pingTimeout: 20_000
   });
 
   function send(socket, message) {
-    if (!socket || socket.readyState !== OPEN) return false;
-    socket.send(JSON.stringify(message));
+    if (!socket?.connected) return false;
+    socket.emit('mafia:message', message);
     return true;
   }
 
@@ -237,15 +246,15 @@ export function createGameServer({ env = process.env, logger = console } = {}) {
 
   function broadcastRoomsList() {
     const list = publicRoomList();
-    for (const socket of webSocketServer.clients) {
-      if (socket.handshaken && socket.readyState === OPEN) send(socket, { type: 'rooms_list', rooms: list });
+    for (const socket of io.sockets.sockets.values()) {
+      if (socket.handshaken && socket.connected) send(socket, { type: 'rooms_list', rooms: list });
     }
   }
 
   function sendRoomState(room) {
     for (const player of room.players) {
       const socket = connections.get(player.clientId);
-      if (socket?.readyState === OPEN) send(socket, { type: 'room_state', state: roomState(room, player.clientId) });
+      if (socket?.connected) send(socket, { type: 'room_state', state: roomState(room, player.clientId) });
     }
   }
 
@@ -253,7 +262,7 @@ export function createGameServer({ env = process.env, logger = console } = {}) {
     const timer = timerSeconds(room);
     for (const player of room.players) {
       const socket = connections.get(player.clientId);
-      if (socket?.readyState === OPEN) {
+      if (socket?.connected) {
         send(socket, { type: 'timer', roomCode: room.code, phase: room.phase, timer });
       }
     }
@@ -261,7 +270,7 @@ export function createGameServer({ env = process.env, logger = console } = {}) {
 
   function sendRole(room, player) {
     const socket = connections.get(player.clientId);
-    if (socket?.readyState === OPEN && player.role) {
+    if (socket?.connected && player.role) {
       send(socket, {
         type: 'role',
         roomCode: room.code,
@@ -296,7 +305,7 @@ export function createGameServer({ env = process.env, logger = console } = {}) {
 
     for (const player of room.players) {
       const socket = connections.get(player.clientId);
-      if (socket?.readyState === OPEN) {
+      if (socket?.connected) {
         send(socket, {
           type: 'history',
           match: {
@@ -363,7 +372,7 @@ export function createGameServer({ env = process.env, logger = console } = {}) {
     if (commissioner && investigationId) {
       const suspect = findPlayer(room, investigationId);
       const socket = connections.get(commissioner.clientId);
-      if (suspect && socket?.readyState === OPEN) {
+      if (suspect && socket?.connected) {
         send(socket, {
           type: 'notification',
           message: `${suspect.name}: ${MAFIA_ROLES.has(suspect.role) ? 'принадлежит мафии' : 'не мафия'}`
@@ -459,7 +468,7 @@ export function createGameServer({ env = process.env, logger = console } = {}) {
   function notifyAll(room, message) {
     for (const player of room.players) {
       const socket = connections.get(player.clientId);
-      if (socket?.readyState === OPEN) send(socket, { type: 'notification', message });
+      if (socket?.connected) send(socket, { type: 'notification', message });
     }
   }
 
@@ -769,13 +778,13 @@ export function createGameServer({ env = process.env, logger = console } = {}) {
   function handleHello(socket, message) {
     if (message.protocol !== PROTOCOL) {
       sendError(socket, `Несовместимый протокол. Нужен ${PROTOCOL}.`);
-      socket.close(1008, 'Unsupported protocol');
+      socket.disconnect(true);
       return;
     }
     const clientId = cleanClientId(message.clientId);
     if (!clientId) {
       sendError(socket, 'Не удалось проверить идентификатор клиента. Перезагрузи страницу.');
-      socket.close(1008, 'Invalid client id');
+      socket.disconnect(true);
       return;
     }
 
@@ -785,8 +794,8 @@ export function createGameServer({ env = process.env, logger = console } = {}) {
     socket.avatar = cleanAvatar(message.avatar);
     socket.handshaken = true;
     connections.set(clientId, socket);
-    if (previous && previous !== socket && previous.readyState === OPEN) {
-      previous.close(4001, 'This client reconnected elsewhere');
+    if (previous && previous !== socket && previous.connected) {
+      previous.disconnect(true);
     }
 
     send(socket, { type: 'hello_ack', protocol: PROTOCOL, server: 'MAFIA', version: '1.0.0' });
@@ -899,33 +908,14 @@ export function createGameServer({ env = process.env, logger = console } = {}) {
     broadcastRoomState(room);
   }
 
-  httpServer.on('upgrade', (request, socket, head) => {
-    const url = new URL(request.url || '/', 'http://localhost');
-    if (url.pathname !== '/ws') {
-      socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
-      socket.destroy();
-      return;
-    }
-    if (!isAllowedOrigin(request.headers.origin, env)) {
-      socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
-      socket.destroy();
-      return;
-    }
-    webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
-      webSocketServer.emit('connection', webSocket, request);
-    });
-  });
-
-  webSocketServer.on('connection', (socket) => {
+  io.on('connection', (socket) => {
     socket.handshaken = false;
     socket.clientId = null;
     socket.roomCode = null;
-    socket.isAlive = true;
     socket.messageTimes = [];
     socket.joinAttempts = [];
 
-    socket.on('pong', () => { socket.isAlive = true; });
-    socket.on('message', (raw) => {
+    socket.on('mafia:message', (message) => {
       const now = Date.now();
       socket.messageTimes = socket.messageTimes.filter((time) => now - time < 10_000);
       if (socket.messageTimes.length >= 80) {
@@ -933,13 +923,6 @@ export function createGameServer({ env = process.env, logger = console } = {}) {
         return;
       }
       socket.messageTimes.push(now);
-      let message;
-      try {
-        message = JSON.parse(raw.toString());
-      } catch {
-        sendError(socket, 'Некорректный JSON.');
-        return;
-      }
       if (message?.type === 'join_room') {
         socket.joinAttempts = socket.joinAttempts.filter((time) => now - time < 60_000);
         if (socket.joinAttempts.length >= 12) {
@@ -951,25 +934,13 @@ export function createGameServer({ env = process.env, logger = console } = {}) {
       try {
         handleMessage(socket, message);
       } catch (error) {
-        logger.error?.('Mafia server message failed:', error);
+        logger.error?.('Mafia Socket.IO message failed:', error);
         sendError(socket, 'Не удалось обработать запрос. Попробуй ещё раз.');
       }
     });
-    socket.on('close', () => detachSocket(socket));
-    socket.on('error', (error) => logger.warn?.('WebSocket connection error:', error.message));
+    socket.on('disconnect', () => detachSocket(socket));
+    socket.on('error', (error) => logger.warn?.('Socket.IO connection error:', error.message));
   });
-
-  const heartbeat = setInterval(() => {
-    for (const socket of webSocketServer.clients) {
-      if (socket.isAlive === false) {
-        socket.terminate();
-        continue;
-      }
-      socket.isAlive = false;
-      socket.ping();
-    }
-  }, 25_000);
-  heartbeat.unref?.();
 
   const gameClock = setInterval(() => {
     const now = Date.now();
@@ -987,21 +958,11 @@ export function createGameServer({ env = process.env, logger = console } = {}) {
   gameClock.unref?.();
 
   function close() {
-    clearInterval(heartbeat);
     clearInterval(gameClock);
-    for (const socket of webSocketServer.clients) socket.terminate();
-    return new Promise((resolve) => {
-      webSocketServer.close(() => {
-        if (!httpServer.listening) {
-          resolve();
-          return;
-        }
-        httpServer.close(() => resolve());
-      });
-    });
+    return new Promise((resolve) => io.close(() => resolve()));
   }
 
-  return { httpServer, webSocketServer, rooms, connections, close };
+  return { httpServer, io, rooms, connections, close };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
