@@ -48,6 +48,7 @@ GitHub Pages публикует только клиент. Реализация 
 - `vendor/socket.io.min.js` — локальная браузерная библиотека Socket.IO.
 - `render.yaml` — Render Blueprint для автоматического создания Web Service.
 - `package.json` и `package-lock.json` — зависимости и команды сервера и тестов.
+- `docs/mafia-online-servers.pptx` — презентация об архитектуре серверов и Socket.IO-обмене.
 
 ## Локальная проверка
 
